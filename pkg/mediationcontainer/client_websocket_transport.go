@@ -169,14 +169,15 @@ func (clientTransport *ClientWebSocketTransport) ListenForMessages() {
 					}
 
 					glog.Errorf("[ListenForMessages] error during receive %v", err)
-					//notify error with the connection
-					clientTransport.connClosedNotificationCh <- true // Note: this will block till the message is received
 					// close current WebSocket connection.
 					clientTransport.closeAndResetWebSocket()
 					clientTransport.stopListenForMessages()
 
+					//notify error with the connection
+					clientTransport.connClosedNotificationCh <- true // Note: this will block till the message is received
+
 					glog.V(2).Infof("[ListenForMessages] error notified, will re-establish websocket connection")
-					break
+					return
 				}
 				// write the message on the channel
 				glog.V(3).Infof("[ListenForMessages] received message on websocket of size %d", len(data))

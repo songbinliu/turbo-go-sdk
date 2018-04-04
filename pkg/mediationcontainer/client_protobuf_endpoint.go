@@ -19,7 +19,7 @@ type ClientProtobufEndpoint struct {
 	// Channel where the endpoint will send the parsed messages
 	ParsedMessageChannel chan *ParsedMessage // unbuffered channel
 	// TODO: add message waiting policy
-	stopMsgWaitCh chan bool // buffered channel
+	stopMsgWaitCh chan struct{} // buffered channel
 }
 
 // Create a new instance of the ClientProtobufEndpoint that handles communication
@@ -28,7 +28,7 @@ func CreateClientProtoBufEndpoint(name string, transport ITransport, messageHand
 	endpoint := &ClientProtobufEndpoint{
 		Name:                 name,
 		transport:            transport, // the transport
-		ParsedMessageChannel: make(chan *ParsedMessage),
+		//ParsedMessageChannel: make(chan *ParsedMessage),
 		messageHandler:       messageHandler, // the message parser
 		singleMessageMode:    singleMessageMode,
 	}
@@ -68,7 +68,6 @@ func (endpoint *ClientProtobufEndpoint) CloseEndpoint() {
 	// Send close to the listener routine
 	if endpoint.stopMsgWaitCh != nil {
 		glog.V(4).Infof("["+endpoint.Name+"] closing stopMsgWaitCh %+v", endpoint.stopMsgWaitCh)
-		endpoint.stopMsgWaitCh <- true
 		close(endpoint.stopMsgWaitCh)
 		glog.V(4).Infof("["+endpoint.Name+"] closed stopMsgWaitCh %+v", endpoint.stopMsgWaitCh)
 	}
@@ -108,10 +107,10 @@ func (endpoint *ClientProtobufEndpoint) waitForServerMessage() {
 				close(endpoint.ParsedMessageChannel) // This listener routine is the writer for this channel
 				glog.V(4).Infof(logPrefix+" closed MessageChannel %+v", endpoint.ParsedMessageChannel)
 				return
-			//default:
 			case rawBytes, ok := <-endpoint.transport.RawMessageReceiver(): // block till  the message bytes from the transport channel,
 				if !ok {
 					glog.Errorf(logPrefix + "transport message channel is closed")
+					endpoint.CloseEndpoint()
 					break
 				}
 				// Parse the input stream using the registered message handler

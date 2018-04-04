@@ -5,8 +5,17 @@ import (
 
 	"github.com/turbonomic/turbo-go-sdk/pkg/probe"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
+	"github.com/turbonomic/turbo-go-sdk/pkg/wsocket"
+	"github.com/turbonomic/turbo-go-sdk/pkg/version"
+
+	protobuf "github.com/golang/protobuf/proto"
 
 	"github.com/golang/glog"
+	"fmt"
+)
+
+const (
+	waitResponseTimeOut = time.Second * 30
 )
 
 // Abstraction to establish session using the specified protocol with the server
@@ -27,6 +36,13 @@ type remoteMediationClient struct {
 	stopMediationClientCh chan struct{}
 	//  Channel to stop the routine that monitors the underlying transport connection
 	closeWatcherCh chan bool
+
+	//new items
+	wsconn *wsocket.WSconnection
+	wsConfig *wsocket.ConnectionConfig
+	wsRetryDuration time.Duration
+	protocolVersion string
+	shouldStop bool
 }
 
 func CreateRemoteMediationClient(allProbes map[string]*ProbeProperties,
@@ -159,19 +175,257 @@ func (remoteMediationClient *remoteMediationClient) Init(probeRegisteredMsgCh ch
 	}
 }
 
+func(m *remoteMediationClient) Start() {
+	for {
+		glog.V(2).Infof("Begin protocol handshake process ...")
+		flag := m.ProtocolHandShake()
+		if !flag {
+			err := fmt.Errorf("MediationClient failed to do protocol hand shake, terminating.")
+			glog.Errorf(err.Error())
+			return err
+		}
+
+		glog.V(2).Infof("begin to server Turbo requests ...")
+
+		if m.shouldStop {
+			glog.V(1).Infof("Mediation client is stopped.")
+			return
+		}
+
+		du := m.wsRetryDuration
+		glog.Errorf("websocket is closed. Will re-connect in %v seconds.", du.Seconds())
+		time.Sleep(du)
+	}
+}
+
 // Stop the remote mediation client by closing the underlying transport and message handler routines
-func (remoteMediationClient *remoteMediationClient) Stop() {
+func (m *remoteMediationClient) Stop() {
 	// First stop the transport connection monitor
-	close(remoteMediationClient.closeWatcherCh)
+	close(m.closeWatcherCh)
 	// Stop the server message listener
-	remoteMediationClient.stopMessageHandler()
+	m.stopMessageHandler()
 	// Close the transport
-	if remoteMediationClient.Transport != nil {
-		remoteMediationClient.Transport.CloseTransportPoint()
+	if m.Transport != nil {
+		m.Transport.CloseTransportPoint()
 	}
 	// Notify the client to stop
-	close(remoteMediationClient.stopMediationClientCh)
+	close(m.stopMediationClientCh)
+
+	// new staff
+	m.shouldStop = true
+	if m.wsconn != nil {
+		m.wsconn.Stop()
+	}
 }
+
+func (m *remoteMediationClient) ProtocolHandShake() bool {
+
+	for {
+		glog.V(2).Infof("begin to connect to server, and do protocol hand shake.")
+		m.buildWSConnection()
+
+		glog.V(2).Infof("begin to do protocol hand shake")
+		flag, err := m.doProtocolHandShake()
+		if err == nil {
+			return flag
+		}
+
+		if !flag {
+			return false
+		}
+
+		du := time.Second * 20
+		glog.Errorf("protocolHandShake failed, will retry in %v seconds", du.Seconds())
+		time.Sleep(du)
+	}
+}
+
+
+func (m *remoteMediationClient) WaitServerRequests() {
+	m.wsconn.Start()
+
+	for {
+		//1. check whether MediationClient should be stopped
+		if m.shouldStop {
+			glog.V(1).Info("Stop waiting for server request: MediationClient should be stopped.")
+			return
+		}
+
+		//2. check whether the underlying websocket is stopped
+		if m.wsconn.IsClosed() {
+			glog.V(1).Info("Stop waiting for server request: websocket is closed.")
+			return
+		}
+
+		//3. get request from server, and handle it
+		datch, err := m.wsconn.GetReceived()
+		if err != nil {
+			glog.Errorf("Stop waiting for server request: %v", err)
+			return
+		}
+
+		timer := time.NewTimer(time.Second * 10)
+		select {
+		case dat := <-datch:
+			if m.wsconn.IsClosed() {
+				glog.V(1).Info("Stop waiting for server request: websocket is closed.")
+				return
+			}
+			go m.handleServerRequest(dat)
+		case <-timer.C:
+			continue
+		}
+	}
+}
+
+func (m *remoteMediationClient) handleServerRequest(dat []byte) error {
+	return nil
+}
+
+func (m *remoteMediationClient) buildWSConnection() error {
+
+	if m.wsconn != nil {
+		m.wsconn.Stop()
+		m.wsconn = nil
+	}
+
+	for {
+		if m.shouldStop {
+			return fmt.Errorf("Stopped")
+		}
+
+		wsconn := wsocket.NewConnection(m.wsConfig)
+		if wsconn == nil {
+			glog.Errorf("Failed to build websocket connection: %++v", m.wsConfig)
+			glog.Errorf("Will Retry in %v seconds", m.wsRetryDuration.Seconds())
+			time.Sleep(m.wsRetryDuration)
+			continue
+		}
+
+		m.wsconn = wsconn
+		break
+	}
+
+	return nil
+}
+
+func (m *remoteMediationClient) negotiationVersion() (bool, error) {
+	//1. negotiation protocol version
+	request := &version.NegotiationRequest{
+		ProtocolVersion: &m.protocolVersion,
+	}
+
+	dat_in, err := protobuf.Marshal(request)
+	if err != nil {
+		glog.Errorf("Failed to marshal Negotiation request(%++v): %v", request, err)
+		return false, err
+	}
+
+	//2. send request and get answer
+	dat_out, err := m.wsconn.SendRecv(dat_in, waitResponseTimeOut)
+	if err != nil {
+		glog.Errorf("Failed to get negotiation response: %v", err)
+		// will retry
+		return true, err
+	}
+
+	//3. parse the answer
+	resp := &version.NegotiationAnswer{}
+	if err := protobuf.Unmarshal(dat_out, resp); err != nil {
+		glog.Errorf("Failed to unmarshal negotiaonAnswer(%s): %v", string(dat_out), err)
+		//will retry
+		return true, err
+	}
+
+	result := resp.GetNegotiationResult()
+	if result != version.NegotiationAnswer_ACCEPTED {
+		glog.Errorf("Protocol Version(%v) Negotiation is not accepted: %v", m.protocolVersion, resp.GetDescription())
+		return false, nil
+	}
+	glog.V(2).Infof("Protocol Version Negotiaion success: %v", m.protocolVersion)
+
+	return true, nil
+}
+
+func (m *remoteMediationClient) makeContainerInfo () (*proto.ContainerInfo, error) {
+	var probes []*proto.ProbeInfo
+
+	for k, v := range m.allProbes {
+		glog.V(2).Infof("SdkClientProtocol] Creating Probe Info for", k)
+		turboProbe := v.Probe
+		var probeInfo *proto.ProbeInfo
+		var err error
+		probeInfo, err = turboProbe.GetProbeInfo()
+
+		if err != nil {
+			return nil, err
+		}
+		probes = append(probes, probeInfo)
+	}
+
+	return &proto.ContainerInfo{
+		Probes: probes,
+	}, nil
+}
+
+func (m *remoteMediationClient) registerProbe() (bool, error) {
+	//1. probe info
+	request, err := m.makeContainerInfo()
+	if err != nil {
+		glog.Errorf("Failed to get container info: %v", err)
+		return false, err
+	}
+
+	dat_in, err := protobuf.Marshal(request)
+	if err != nil {
+		glog.Errorf("Failed to marshal probeInfo (%++v): %v", request, err)
+		return false, err
+	}
+
+	//2. send request and get response
+	dat_out, err := m.wsconn.SendRecv(dat_in, waitResponseTimeOut)
+	if err != nil {
+		glog.Errorf("Failed to get registration response: %v", err)
+		return true, err
+	}
+
+	//3. parse the answer
+	resp := &proto.Ack{}
+	if err := protobuf.Unmarshal(dat_out, resp); err != nil {
+		glog.Errorf("Failed to unmarshl registration ack(%s): %v", string(dat_out), err)
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (m *remoteMediationClient) doProtocolHandShake() (bool, error) {
+
+	//1. protocol version negotiation
+	flag, err := m.negotiationVersion()
+	if err != nil {
+		glog.Errorf("protocolHandShake failed: %v", err)
+		return flag, err
+	}
+
+	if !flag {
+		glog.Errorf("protocolHandShake is not accepted: %s is not accepted", m.protocolVersion)
+		return false, nil
+	}
+	glog.V(3).Infof("probe protocol version negotiation success")
+
+	//2. register probe info
+	flag, err = m.registerProbe()
+	if err != nil {
+		glog.Errorf("protocolHandShake failed: %v", err)
+		return flag, err
+	}
+	glog.V(3).Infof("probe registration success")
+
+	return true, nil
+}
+
+
 
 // ======================== Listen for server messages ===================
 // Sends message to the server message listener to close the protobuf endpoint and message listener
